@@ -6,12 +6,14 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 
 SERIES = ["DGS2", "DGS10", "DFF"]
 CACHE_DIR = Path("data")
-THRESHOLDS_BP = [0, 25, 50, 75, 100]
+EVAL_START = "1981-07-14"
 
 
 # ---------------------------------------------------------------------------
@@ -44,436 +46,269 @@ def prepare(raw: dict) -> pd.DataFrame:
         }
     ).dropna()
     df["ff_s"] = df["ff"].rolling(5, min_periods=1).median()
-    df["flattener_gap"] = df["y2"] - df["ff_s"]
+    df["gap"] = df["y2"] - df["ff_s"]
     return df
 
 
 # ---------------------------------------------------------------------------
-# Bond maths
+# Bond maths (from original model)
 # ---------------------------------------------------------------------------
-def par_bond_price(coupon: pd.Series, yield_pct: pd.Series, years: int) -> pd.Series:
-    y = np.maximum(yield_pct / 100.0, 1e-4)
-    v = (1.0 + y / 2.0) ** (-2.0 * years)
-    return coupon / y * (1.0 - v) + v
+def par_bond_price(c, y, n):
+    """Price per 1 face of an n-year semiannual bond, coupon c, yield y (decimals)."""
+    v = (1 + y / 2) ** (-2 * n)
+    return c / y * (1 - v) + v
 
 
-def mod_duration(y_pct: pd.Series, years: int) -> pd.Series:
-    y = np.maximum(y_pct / 100.0, 1e-4)
-    return (1.0 / y) * (1.0 - (1.0 + y / 2.0) ** (-2.0 * years))
+def mod_duration(y_pct, n):
+    y = np.maximum(y_pct / 100, 1e-4)
+    return (1 / y) * (1 - (1 + y / 2) ** (-2 * n))
 
 
-def excess_returns(y_pct: pd.Series, cash_pct: pd.Series, years: int) -> pd.Series:
-    y = np.maximum(y_pct / 100.0, 1e-4)
+def excess_returns(y_pct: pd.Series, cash_pct: pd.Series, n: int) -> pd.Series:
+    """Daily excess return (over cash) of a constant-maturity n-year bond."""
+    y = np.maximum(y_pct / 100, 1e-4)
     c_prev = y.shift(1)
     dt = y.index.to_series().diff().dt.days / 365.0
-    price_ret = par_bond_price(c_prev, y, years) - 1.0
+    price_ret = par_bond_price(c_prev, y, n) - 1
     carry = c_prev * dt
-    financing = (cash_pct / 100.0).shift(1) * dt
+    financing = (cash_pct / 100).shift(1) * dt
     return price_ret + carry - financing
 
 
 def flattener_returns(df: pd.DataFrame):
+    """Return of a DV01-neutral FLATTENER (long 10y, short 2y) per 1 unit of 10y notional."""
     r2 = excess_returns(df["y2"], df["ff_s"], 2)
     r10 = excess_returns(df["y10"], df["ff_s"], 10)
     n2_lag = mod_duration(df["y10"].shift(1), 10) / mod_duration(df["y2"].shift(1), 2)
-    flat_ret = r10 - n2_lag * r2
-    return flat_ret, n2_lag
+    return r10 - n2_lag * r2, n2_lag
 
 
 # ---------------------------------------------------------------------------
-# Strategy backtests
+# Strategy backtest (matching original model exactly)
 # ---------------------------------------------------------------------------
-def backtest_binary_threshold(df: pd.DataFrame, threshold_bp: float, cost10_bps: float = 1.0, cost2_bps: float = 0.3) -> pd.DataFrame:
+def backtest(
+    df: pd.DataFrame,
+    min_gap_pp: float = 0.0,
+    target_vol: float = 0.10,
+    vol_window: int = 60,
+    max_lev: float = 5.0,
+    rebal_days: int = 5,
+    cost10_bps: float = 1.0,
+    cost2_bps: float = 0.3,
+) -> pd.DataFrame:
+    """
+    Backtest matching the original flattener_model.py logic exactly.
+    Returns dataframe with strategy returns, positions, and diagnostic info.
+    """
     flat_ret, n2_lag = flattener_returns(df)
-    signal = (df["flattener_gap"] > threshold_bp / 10000.0).astype(float)
-    position = (-signal.shift(1).fillna(0.0)).astype(float)
-    exposure = -position
-    cost = position.diff().abs().fillna(0.0) * (cost10_bps + cost2_bps * n2_lag.shift(1)) / 1e4
-    strategy_ret = exposure * flat_ret - cost
+    
+    # Signal: 1 when 2y yield is above fed funds by more than min_gap_pp
+    signal = (df["gap"] > min_gap_pp).astype(float)
+    
+    # Volatility and position sizing
+    vol = flat_ret.rolling(vol_window).std() * np.sqrt(252)
+    w = (signal * target_vol / vol).clip(0, max_lev)
+    
+    # Rebalance every rebal_days
+    w = w.iloc[::rebal_days].reindex(w.index).ffill()
+    
+    # Position held from t+1 (signal at close t, position in t+1)
+    pos = w.shift(1)
+    
+    # Trading costs
+    cost = pos.diff().abs() * (cost10_bps + cost2_bps * n2_lag.shift(1)) / 1e4
+    
+    # Strategy return
+    strat = pos * flat_ret - cost
+    
+    # Build output dataframe
     out = pd.DataFrame(
         {
-            "strategy_ret": strategy_ret,
-            "flat_ret": flat_ret,
-            "position": position,
-            "exposure": exposure,
-            "gap": df["flattener_gap"],
+            "strategy": strat,
+            "position": pos,
             "signal": signal,
+            "gap": df["gap"],
             "y2": df["y2"],
             "y10": df["y10"],
             "ff_s": df["ff_s"],
+            "flat_ret": flat_ret,
+            "vol": vol,
+            "cost": cost,
+            "n2_lag": n2_lag,
         }
-    ).dropna()
-    return out
+    ).dropna(subset=["strategy"])
+    
+    return out.loc[EVAL_START:]
 
 
-def metrics(ret: pd.Series, pos: pd.Series | None = None) -> dict:
-    ret = ret.dropna()
-    if ret.empty:
+def metrics(r: pd.Series) -> dict:
+    """Calculate performance metrics from return series."""
+    r = r.dropna()
+    if len(r) == 0:
         return {
-            "CAGR": np.nan,
-            "Volatility": np.nan,
+            "CAGR %": np.nan,
+            "Vol %": np.nan,
             "Sharpe": np.nan,
-            "MaxDD": np.nan,
+            "MaxDD %": np.nan,
             "Calmar": np.nan,
-            "TradingDays": 0,
-            "PctInvested": np.nan,
-            "t_stat": np.nan,
         }
-
-    cumprod = (1.0 + ret).cumprod()
-    total_ret = cumprod.iloc[-1] - 1.0
-    cagr = (1.0 + total_ret) ** (252.0 / len(ret)) - 1.0
-
-    vol = ret.std(ddof=0) * np.sqrt(252.0)
-    sharpe = (ret.mean() * 252.0) / vol if vol > 0 else np.nan
-
-    dd = cumprod / cumprod.cummax() - 1.0
+    
+    ann = r.mean() * 252
+    vol = r.std() * np.sqrt(252)
+    eq = (1 + r).cumprod()
+    dd = eq / eq.cummax() - 1
+    
+    sharpe = ann / vol if vol > 0 else np.nan
     max_dd = dd.min()
-    calmar = cagr / abs(max_dd) if max_dd < 0 else np.nan
-
-    pct_invested = (pos != 0).mean() * 100.0 if pos is not None else np.nan
-    t_stat = sharpe * np.sqrt(len(ret) / 252.0) if np.isfinite(sharpe) else np.nan
-
+    calmar = ann / abs(max_dd) if max_dd < 0 else np.nan
+    
     return {
-        "CAGR": cagr,
-        "Volatility": vol,
+        "CAGR %": ann * 100,
+        "Vol %": vol * 100,
         "Sharpe": sharpe,
-        "MaxDD": max_dd,
+        "MaxDD %": max_dd * 100,
         "Calmar": calmar,
-        "TradingDays": len(ret),
-        "PctInvested": pct_invested,
-        "t_stat": t_stat,
     }
 
 
-def date_mask(df: pd.DataFrame, start: str | None = None, end: str | None = None, exclude_ranges=None) -> pd.Series:
-    mask = pd.Series(True, index=df.index)
-    if start is not None:
-        mask &= df.index >= start
-    if end is not None:
-        mask &= df.index <= end
-    if exclude_ranges is not None:
-        for s, e in exclude_ranges:
-            mask &= ~((df.index >= s) & (df.index <= e))
-    return mask
-
-
 # ---------------------------------------------------------------------------
-# Period/robustness outputs
+# Save trade-level CSV
 # ---------------------------------------------------------------------------
-def threshold_results(df: pd.DataFrame):
-    periods = [
-        ("Full sample", None, None, []),
-        ("Since 1994", "1994-02-04", None, []),
-        ("Since 2000", "2000-01-01", None, []),
-    ]
-    robustness = {
-        "Exclude 2009-2015": [("2009-01-01", "2015-12-31")],
-        "Exclude 2020-2022": [("2020-01-01", "2022-12-31")],
-        "Exclude both": [("2009-01-01", "2015-12-31"), ("2020-01-01", "2022-12-31")],
-    }
-
-    output = {}
-    for period_label, start, end, _ in periods:
-        output[period_label] = {}
-        for thr in THRESHOLDS_BP:
-            sub = df.loc[date_mask(df, start=start, end=end)]
-            out = backtest_binary_threshold(sub, thr)
-            output[period_label][thr] = metrics(out["strategy_ret"], out["position"])
-        for rob_label, ranges in robustness.items():
-            label = f"{period_label} | {rob_label}"
-            output[label] = {}
-            for thr in THRESHOLDS_BP:
-                sub = df.loc[date_mask(df, start=start, end=end, exclude_ranges=ranges)]
-                out = backtest_binary_threshold(sub, thr)
-                output[label][thr] = metrics(out["strategy_ret"], out["position"])
-
-    return output
-
-
-def print_threshold_table(output: dict):
-    print("\n=== Strict binary flattener threshold results ===")
-    print("Signal rule: if (DGS2 - DFF) > threshold then position = -1 else 0")
-    print("Long 10Y / short 2Y DV01-neutral flattener return, same cost assumptions as original model\n")
-
-    for label, by_threshold in output.items():
-        print(f"--- {label} ---")
-        rows = []
-        for thr in THRESHOLDS_BP:
-            m = by_threshold[thr]
-            rows.append(
-                {
-                    "Threshold bp": thr,
-                    "CAGR": m["CAGR"],
-                    "Volatility": m["Volatility"],
-                    "Sharpe": m["Sharpe"],
-                    "MaxDD": m["MaxDD"],
-                    "Calmar": m["Calmar"],
-                    "TradingDays": m["TradingDays"],
-                    "PctInvested": m["PctInvested"],
-                    "t_stat": m["t_stat"],
-                }
-            )
-        tbl = pd.DataFrame(rows).set_index("Threshold bp")
-        tbl["CAGR"] = tbl["CAGR"] * 100.0
-        tbl["Volatility"] = tbl["Volatility"] * 100.0
-        tbl["MaxDD"] = tbl["MaxDD"] * 100.0
-        print(tbl.round(3).to_string())
-        print()
-
-
-# ---------------------------------------------------------------------------
-# Marginal contribution by gap bucket
-# ---------------------------------------------------------------------------
-def bucket_contribution(df: pd.DataFrame):
-    flat_ret, _ = flattener_returns(df)
-    gap = df["flattener_gap"]
-    positive_gap = gap > 0
-
-    bucket_defs = [
-        ("0-25 bp", lambda g: (g > 0.0 / 10000.0) & (g <= 25.0 / 10000.0)),
-        ("25-50 bp", lambda g: (g > 25.0 / 10000.0) & (g <= 50.0 / 10000.0)),
-        ("50-75 bp", lambda g: (g > 50.0 / 10000.0) & (g <= 75.0 / 10000.0)),
-        ("75-100 bp", lambda g: (g > 75.0 / 10000.0) & (g <= 100.0 / 10000.0)),
-        ("100 bp+", lambda g: (g > 100.0 / 10000.0)),
-    ]
-
-    bucket_rows = []
-    bucket_rets = []
-    for name, cond_fn in bucket_defs:
-        mask = cond_fn(gap) & positive_gap
-        if not mask.any():
-            continue
-        ret = flat_ret[mask].dropna()
-        avg_daily = ret.mean()
-        annualized = (1.0 + ret).prod() ** (252.0 / len(ret)) - 1.0 if len(ret) > 0 else np.nan
-        vol = ret.std(ddof=0) * np.sqrt(252.0)
-        sharpe = (ret.mean() * 252.0) / vol if vol > 0 else np.nan
-        cumul = (1.0 + ret).prod() - 1.0 if len(ret) > 0 else np.nan
-        bucket_rows.append(
-            {
-                "Bucket": name,
-                "Average daily return": avg_daily,
-                "Annualized return": annualized,
-                "Sharpe": sharpe,
-                "Cumulative contribution": cumul,
-            }
-        )
-        bucket_rets.append(ret)
-
-    tbl = pd.DataFrame(bucket_rows)
-    if tbl.empty:
-        return tbl
-
-    total_pnl = pd.concat(bucket_rets) if bucket_rets else pd.Series(dtype=float)
-    total_pnl_cum = (1.0 + total_pnl).prod() - 1.0 if len(total_pnl) > 0 else np.nan
-    if np.isfinite(total_pnl_cum):
-        tbl["% of total P&L"] = tbl["Cumulative contribution"] / total_pnl_cum * 100.0
-    else:
-        tbl["% of total P&L"] = np.nan
-    return tbl
-
-
-def print_bucket_table(df: pd.DataFrame):
-    print("\n=== Marginal contribution by signal-strength bucket ===")
-    tbl = bucket_contribution(df)
-    if tbl.empty:
-        print("No positive-gap days in the sample.")
-        return
-
-    tbl["Average daily return"] = tbl["Average daily return"] * 100.0
-    tbl["Annualized return"] = tbl["Annualized return"] * 100.0
-    tbl["Cumulative contribution"] = tbl["Cumulative contribution"] * 100.0
-    tbl["% of total P&L"] = tbl["% of total P&L"]
-    print(tbl.round(3).to_string(index=False))
-    print()
+def save_trades_csv(out: pd.DataFrame, threshold_bp: float, filename: str):
+    """Export every day of the strategy with position, gap, returns, etc."""
+    export = out[["gap", "y2", "y10", "ff_s", "position", "flat_ret", "strategy", "cost"]].copy()
+    export.columns = ["gap_pp", "y2_yield_%", "y10_yield_%", "ff_s_%", "position_size", "flattener_ret", "strategy_ret", "cost_bps"]
+    export["threshold_bp"] = threshold_bp
+    export["in_market"] = (export["position_size"] > 0).astype(int)
+    export.to_csv(filename)
+    print(f"Saved: {filename}")
 
 
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
-def save_plot(fig, path: str):
-    fig.savefig(path, dpi=180, bbox_inches="tight")
+def plot_strategy_comparison(df: pd.DataFrame):
+    """
+    Create side-by-side comparison of gap > 0 bp vs gap > 25 bp,
+    matching the style of the provided reference image.
+    """
+    # Run both backtests
+    out0 = backtest(df, min_gap_pp=0.0)
+    out25 = backtest(df, min_gap_pp=0.25)
+    
+    # Compute cumulative equity
+    eq0 = (1 + out0["strategy"]).cumprod()
+    eq25 = (1 + out25["strategy"]).cumprod()
+    
+    # Compute drawdowns
+    dd0 = eq0 / eq0.cummax() - 1
+    dd25 = eq25 / eq25.cummax() - 1
+    
+    # Create figure with two subplots
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.30)
+    ax_eq = fig.add_subplot(gs[0])
+    ax_dd = fig.add_subplot(gs[1], sharex=ax_eq)
+    
+    # Styling
+    SURF = "#fcfcfb"
+    INK = "#0b0b0b"
+    INK2 = "#52514e"
+    MUTED = "#898781"
+    GRID = "#e1e0d9"
+    AXIS = "#c3c2b7"
+    C_BASE = "#2a78d6"
+    C_THRESHOLD = "#eb6834"
+    
+    fig.set_facecolor(SURF)
+    for ax in [ax_eq, ax_dd]:
+        ax.set_facecolor(SURF)
+        for s in ("top", "right", "left"):
+            ax.spines[s].set_visible(False)
+        ax.spines["bottom"].set_color(AXIS)
+        ax.spines["bottom"].set_linewidth(0.5)
+        ax.grid(axis="y", color=GRID, linewidth=0.5, linestyle="-")
+        ax.set_axisbelow(True)
+        ax.tick_params(axis="both", length=0, labelsize=9, labelcolor=MUTED)
+    
+    # Equity plot
+    ax_eq.plot(eq0.index, eq0.values, color=C_BASE, linewidth=2.0, label="Gap > 0 bp (base)", solid_capstyle="round")
+    ax_eq.plot(eq25.index, eq25.values, color=C_THRESHOLD, linewidth=2.0, label="Gap > 25 bp (threshold)", solid_capstyle="round")
+    
+    # Endpoint annotations
+    ax_eq.scatter([eq0.index[-1]], [eq0.iloc[-1]], s=22, color=C_BASE, edgecolor=SURF, linewidth=1.0, zorder=5, clip_on=False)
+    ax_eq.scatter([eq25.index[-1]], [eq25.iloc[-1]], s=22, color=C_THRESHOLD, edgecolor=SURF, linewidth=1.0, zorder=5, clip_on=False)
+    
+    ax_eq.annotate(f"{eq0.iloc[-1]:.2f}x", (eq0.index[-1], eq0.iloc[-1]), xytext=(9, 0), textcoords="offset points",
+                   va="center", fontsize=10, color=INK, annotation_clip=False)
+    ax_eq.annotate(f"{eq25.iloc[-1]:.2f}x", (eq25.index[-1], eq25.iloc[-1]), xytext=(9, 6), textcoords="offset points",
+                   va="center", fontsize=10, color=INK, annotation_clip=False)
+    
+    # Log scale
+    ax_eq.set_yscale("log")
+    lo = min(eq0.min(), eq25.min()) * 0.85
+    hi = max(eq0.max(), eq25.max()) * 1.2
+    ax_eq.set_ylim(lo, hi)
+    
+    # Y-axis ticks for log scale
+    ticks = [t for t in (0.25, 0.5, 1, 2, 4, 8, 16, 32) if lo <= t <= hi]
+    if len(ticks) >= 2:
+        ax_eq.set_yticks(ticks)
+        ax_eq.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}x"))
+    
+    ax_eq.set_title("2s10s DV01-neutral flattener: Gap > 0 bp vs Gap > 25 bp", loc="left", fontsize=12, color=INK2, fontweight="bold", pad=8)
+    ax_eq.legend(loc="upper left", frameon=False, fontsize=10, labelcolor=INK2, handlelength=1.8)
+    plt.setp(ax_eq.get_xticklabels(), visible=False)
+    
+    # Drawdown plot
+    ax_dd.plot(dd0.index, dd0.values * 100, color=C_BASE, linewidth=2.0, solid_capstyle="round")
+    ax_dd.plot(dd25.index, dd25.values * 100, color=C_THRESHOLD, linewidth=2.0, solid_capstyle="round")
+    ax_dd.axhline(0, color=AXIS, lw=0.5)
+    ax_dd.yaxis.set_major_formatter(FuncFormatter(lambda v, _: "0%" if v == 0 else f"−{abs(v):.0f}%"))
+    ax_dd.set_title("Drawdown from prior high", loc="left", fontsize=10, color=INK2, fontweight="bold", pad=8)
+    ax_dd.set_ylabel("Drawdown", fontsize=9, color=MUTED)
+    
+    # X-axis formatting
+    ax_dd.xaxis.set_major_locator(mdates.YearLocator(5))
+    ax_dd.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax_dd.set_xlim(eq0.index[0], eq0.index[-1])
+    plt.setp(ax_dd.get_xticklabels(), rotation=45, ha="right")
+    
+    # Title and footer
+    fig.text(0.075, 0.955, "Fed-cycle flattener: 0 bp vs 25 bp threshold comparison",
+             fontsize=14, color=INK, fontweight="bold", va="top")
+    fig.text(0.075, 0.918,
+             f"DV01-neutral long 10Y / short 2Y. Signal: 2Y > Fed Funds (+ threshold). Vol-targeted 10%. {EVAL_START[:4]}–2026.\n"
+             "Excess returns over cash, after costs. Not a recommendation to trade.",
+             fontsize=9.5, color=INK2, va="top", linespacing=1.5)
+    
+    fig.savefig("flattener_comparison.png", dpi=180, facecolor=SURF, bbox_inches="tight")
     plt.close(fig)
-
-
-def plot_cumulative_returns_comparison(df: pd.DataFrame):
-    """Compare cumulative returns for gap > 0 bp and gap > 25 bp."""
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-    thresholds = [0, 25]
-    colors = ["#2E86AB", "#A23B72"]
-
-    for ax, threshold, color in zip(axes, thresholds, colors):
-        out = backtest_binary_threshold(df, threshold)
-        out = out.loc["1981-07-14":]
-
-        eq = (1.0 + out["strategy_ret"]).cumprod()
-        ax.plot(eq.index, eq.values, linewidth=2.2, color=color, label=f"Gap > {threshold} bp")
-        ax.fill_between(eq.index, eq.values, eq.cummax(), color=color, alpha=0.12)
-
-        m = metrics(out["strategy_ret"], out["position"])
-        text = (
-            f"CAGR: {m['CAGR'] * 100:.2f}%\n"
-            f"Sharpe: {m['Sharpe']:.2f}\n"
-            f"Vol: {m['Volatility'] * 100:.2f}%\n"
-            f"MaxDD: {m['MaxDD'] * 100:.2f}%\n"
-            f"Calmar: {m['Calmar']:.2f}\n"
-            f"Days: {m['TradingDays']}\n"
-            f"% Invested: {m['PctInvested']:.1f}%"
-        )
-        ax.text(
-            0.02,
-            0.98,
-            text,
-            transform=ax.transAxes,
-            fontsize=9.5,
-            verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.85),
-            family="monospace",
-        )
-
-        ax.set_yscale("log")
-        ax.set_title(f"Gap > {threshold} bp", fontsize=13, fontweight="bold")
-        ax.set_xlabel("Date", fontsize=11)
-        ax.set_ylabel("Growth of $1 (log scale)", fontsize=11)
-        ax.grid(True, alpha=0.25, linestyle="--")
-        ax.legend(loc="upper left", fontsize=9)
-
-    fig.tight_layout()
-    fig.savefig("cumulative_returns_comparison.png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    print("Saved: cumulative_returns_comparison.png")
-
-
-def plot_threshold_summary(output: dict):
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    axes = axes.ravel()
-    labels = [
-        "Full sample",
-        "Since 1994",
-        "Since 2000",
-        "Full sample | Exclude both",
-    ]
-
-    for ax, label in zip(axes, labels):
-        if label not in output:
-            continue
-        arr = []
-        for thr in THRESHOLDS_BP:
-            m = output[label][thr]
-            arr.append({"thr": thr, "CAGR": m["CAGR"], "Sharpe": m["Sharpe"], "MaxDD": m["MaxDD"]})
-        arr = pd.DataFrame(arr)
-        if arr.empty:
-            continue
-        ax.plot(arr["thr"], arr["CAGR"] * 100.0, marker="o", label="CAGR", linewidth=2)
-        ax.plot(arr["thr"], arr["Sharpe"], marker="s", label="Sharpe", linewidth=2)
-        ax2 = ax.twinx()
-        ax2.plot(arr["thr"], arr["MaxDD"] * 100.0, marker="^", color="C2", label="MaxDD", linewidth=2)
-        ax.set_title(label, fontsize=12, fontweight="bold")
-        ax.set_xlabel("Threshold (bp)")
-        ax.set_ylabel("CAGR % / Sharpe")
-        ax2.set_ylabel("MaxDD %")
-        ax.grid(True, alpha=0.25)
-
-    handles1, labels1 = axes[0].get_legend_handles_labels()
-    handles2, labels2 = axes[0].get_legend_handles_labels()
-    fig.legend(handles1 + handles2, labels1 + labels2, loc="upper center", ncol=3)
-    fig.suptitle("Threshold Performance Summary", fontsize=14, fontweight="bold", y=0.995)
-    save_plot(fig, "threshold_summary.png")
-    print("Saved: threshold_summary.png")
-
-
-def plot_bucket_contribution(df: pd.DataFrame):
-    tbl = bucket_contribution(df)
-    if tbl.empty:
-        return
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bars = ax.bar(tbl["Bucket"], tbl["Cumulative contribution"] * 100.0, 
-                  color=["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974"], edgecolor="black", linewidth=1.2)
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_title("Cumulative Contribution by Gap-Strength Bucket", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Cumulative Contribution (%)", fontsize=11)
-    ax.set_xlabel("Gap Bucket", fontsize=11)
-    ax.grid(True, alpha=0.3, axis="y", linestyle="--")
-
-    for b, v in zip(bars, tbl["Cumulative contribution"] * 100.0):
-        ax.text(b.get_x() + b.get_width() / 2, v + 1.5 if v > 0 else v - 1.5, 
-                f"{v:.1f}%", ha="center", va="bottom" if v > 0 else "top", fontsize=10, fontweight="bold")
-    fig.tight_layout()
-    save_plot(fig, "bucket_contribution.png")
-    print("Saved: bucket_contribution.png")
-
-
-def plot_bucket_sharpe(df: pd.DataFrame):
-    tbl = bucket_contribution(df)
-    if tbl.empty:
-        return
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bars = ax.bar(tbl["Bucket"], tbl["Sharpe"], 
-                  color=["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974"], edgecolor="black", linewidth=1.2)
-    ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_title("Sharpe Ratio by Gap-Strength Bucket", fontsize=13, fontweight="bold")
-    ax.set_ylabel("Sharpe", fontsize=11)
-    ax.set_xlabel("Gap Bucket", fontsize=11)
-    ax.grid(True, alpha=0.3, axis="y", linestyle="--")
-
-    for b, v in zip(bars, tbl["Sharpe"]):
-        ax.text(b.get_x() + b.get_width() / 2, v + 0.05 if v > 0 else v - 0.05, 
-                f"{v:.2f}", ha="center", va="bottom" if v > 0 else "top", fontsize=10, fontweight="bold")
-    fig.tight_layout()
-    save_plot(fig, "bucket_sharpe.png")
-    print("Saved: bucket_sharpe.png")
-
-
-def plot_threshold_regime_lines(df: pd.DataFrame):
-    labels = [
-        ("Full sample", None, None, []),
-        ("Since 1994", "1994-02-04", None, []),
-        ("Since 2000", "2000-01-01", None, []),
-    ]
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    for ax, (label, start, end, exclude) in zip(axes, labels):
-        sub = df.loc[date_mask(df, start=start, end=end, exclude_ranges=exclude)]
-        rows = []
-        for thr in THRESHOLDS_BP:
-            out = backtest_binary_threshold(sub, thr)
-            m = metrics(out["strategy_ret"], out["position"])
-            rows.append({"thr": thr, "Sharpe": m["Sharpe"], "CAGR": m["CAGR"] * 100.0, "MaxDD": m["MaxDD"] * 100.0})
-        rows = pd.DataFrame(rows)
-        ax.plot(rows["thr"], rows["Sharpe"], marker="o", label="Sharpe", linewidth=2, markersize=8)
-        ax2 = ax.twinx()
-        ax2.plot(rows["thr"], rows["CAGR"], marker="s", color="C1", label="CAGR", linewidth=2, markersize=8)
-        ax.set_title(label, fontsize=12, fontweight="bold")
-        ax.set_xlabel("Threshold (bp)", fontsize=10)
-        ax.set_ylabel("Sharpe", fontsize=10)
-        ax2.set_ylabel("CAGR %", fontsize=10)
-        ax.grid(True, alpha=0.3, linestyle="--")
-        ax.set_xticks(THRESHOLDS_BP)
-    fig.suptitle("Performance Across Thresholds by Period", fontsize=14, fontweight="bold", y=1.00)
-    fig.tight_layout()
-    save_plot(fig, "threshold_regime_lines.png")
-    print("Saved: threshold_regime_lines.png")
+    print("Saved: flattener_comparison.png")
 
 
 # ---------------------------------------------------------------------------
-# Interpretation
+# Print summary stats
 # ---------------------------------------------------------------------------
-def interpret_edge(df: pd.DataFrame):
-    tbl = bucket_contribution(df)
-    if tbl.empty:
-        return
-    strong = tbl[tbl["Bucket"].isin(["25-50 bp", "50-75 bp", "75-100 bp", "100 bp+"])]["% of total P&L"].sum()
-    weak = tbl[tbl["Bucket"] == "0-25 bp"]["% of total P&L"].sum() if (tbl["Bucket"] == "0-25 bp").any() else 0.0
-    print("\n=== Economic interpretation ===")
-    print(f"Strong-gap buckets (25-100 bp and above) account for {strong:.1f}% of total P&L.")
-    print(f"Weak-gap bucket (0-25 bp) accounts for {weak:.1f}% of total P&L.")
-    if strong > weak:
-        print("Interpretation: the return is concentrated in strong-gap environments rather than the broad flattener signal.")
-    else:
-        print("Interpretation: weaker gap states are still economically important, so the edge is not purely concentrated in strong gaps.")
-    print("The economically robust conclusion is the one that survives the ZIRP and pandemic exclusions without being driven by a single threshold.")
+def print_comparison_metrics(df: pd.DataFrame):
+    out0 = backtest(df, min_gap_pp=0.0)
+    out25 = backtest(df, min_gap_pp=0.25)
+    
+    m0 = metrics(out0["strategy"])
+    m25 = metrics(out25["strategy"])
+    
+    print("\n=== Strategy Comparison ===")
+    print(f"\nGap > 0 bp (BASE):")
+    for key, val in m0.items():
+        print(f"  {key}: {val:.2f}" if np.isfinite(val) else f"  {key}: {val}")
+    print(f"  % days in market: {(out0['position'] > 0).mean() * 100:.1f}%")
+    
+    print(f"\nGap > 25 bp (THRESHOLD):")
+    for key, val in m25.items():
+        print(f"  {key}: {val:.2f}" if np.isfinite(val) else f"  {key}: {val}")
+    print(f"  % days in market: {(out25['position'] > 0).mean() * 100:.1f}%")
+    
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -482,19 +317,19 @@ def interpret_edge(df: pd.DataFrame):
 def main():
     raw = {sid: load_fred(sid) for sid in SERIES}
     df = prepare(raw)
-
-    output = threshold_results(df)
-    print_threshold_table(output)
-    print_bucket_table(df)
-
-    print("\n=== Generating plots ===")
-    plot_cumulative_returns_comparison(df)
-    plot_threshold_summary(output)
-    plot_bucket_contribution(df)
-    plot_bucket_sharpe(df)
-    plot_threshold_regime_lines(df)
-
-    interpret_edge(df)
+    
+    # Run base strategy (threshold 0)
+    out_base = backtest(df, min_gap_pp=0.0)
+    
+    # Save trades CSV for the base strategy
+    save_trades_csv(out_base, threshold_bp=0, filename="flattener_trades_0bp.csv")
+    
+    # Print metrics comparison
+    print_comparison_metrics(df)
+    
+    # Plot comparison
+    print("\n=== Generating plot ===")
+    plot_strategy_comparison(df)
 
 
 if __name__ == "__main__":
