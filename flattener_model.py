@@ -300,6 +300,43 @@ def save_plot(fig, path: str):
     plt.close(fig)
 
 
+def plot_cumulative_returns_comparison(df: pd.DataFrame):
+    """Plot cumulative returns for gap > 0 vs gap > 25 bp side by side."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    thresholds_to_plot = [0, 25]
+    colors = ["#2E86AB", "#A23B72"]
+    
+    for ax, threshold, color in zip(axes, thresholds_to_plot, colors):
+        out = backtest_binary_threshold(df, threshold)
+        out = out.loc["1981-07-14":]  # Match eval_start from original
+        
+        # Cumulative returns
+        cumulative_ret = (1.0 + out["strategy_ret"]).cumprod()
+        ax.plot(cumulative_ret.index, cumulative_ret.values, linewidth=2.0, color=color, label=f"Gap > {threshold} bp")
+        
+        # Add fill to show drawdowns
+        dd = cumulative_ret / cumulative_ret.cummax() - 1.0
+        ax.fill_between(cumulative_ret.index, cumulative_ret.values, cumulative_ret.cummax(), alpha=0.2, color=color)
+        
+        # Formatting
+        ax.set_yscale("log")
+        ax.set_title(f"Gap > {threshold} bp: Cumulative Returns", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Date", fontsize=11)
+        ax.set_ylabel("Growth of $1 (log scale)", fontsize=11)
+        ax.grid(True, alpha=0.3, linestyle="--")
+        
+        # Metrics
+        m = metrics(out["strategy_ret"], out["position"])
+        textstr = f"CAGR: {m['CAGR']*100:.2f}%\nSharpe: {m['Sharpe']:.2f}\nVol: {m['Volatility']*100:.2f}%\nMaxDD: {m['MaxDD']*100:.2f}%\nCalmar: {m['Calmar']:.2f}\nDays: {m['TradingDays']}\n% Invested: {m['PctInvested']:.1f}%"
+        ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=10, verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8), family="monospace")
+    
+    fig.tight_layout()
+    save_plot(fig, "cumulative_returns_comparison.png")
+    print("Saved: cumulative_returns_comparison.png")
+
+
 def plot_threshold_summary(output: dict):
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     axes = axes.ravel()
@@ -320,11 +357,11 @@ def plot_threshold_summary(output: dict):
         arr = pd.DataFrame(arr)
         if arr.empty:
             continue
-        ax.plot(arr["thr"], arr["CAGR"] * 100.0, marker="o", label="CAGR")
-        ax.plot(arr["thr"], arr["Sharpe"], marker="s", label="Sharpe")
+        ax.plot(arr["thr"], arr["CAGR"] * 100.0, marker="o", label="CAGR", linewidth=2)
+        ax.plot(arr["thr"], arr["Sharpe"], marker="s", label="Sharpe", linewidth=2)
         ax2 = ax.twinx()
-        ax2.plot(arr["thr"], arr["MaxDD"] * 100.0, marker="^", color="C2", label="MaxDD")
-        ax.set_title(label)
+        ax2.plot(arr["thr"], arr["MaxDD"] * 100.0, marker="^", color="C2", label="MaxDD", linewidth=2)
+        ax.set_title(label, fontsize=12, fontweight="bold")
         ax.set_xlabel("Threshold (bp)")
         ax.set_ylabel("CAGR % / Sharpe")
         ax2.set_ylabel("MaxDD %")
@@ -333,7 +370,9 @@ def plot_threshold_summary(output: dict):
     handles1, labels1 = axes[0].get_legend_handles_labels()
     handles2, labels2 = axes[0].get_legend_handles_labels()
     fig.legend(handles1 + handles2, labels1 + labels2, loc="upper center", ncol=3)
+    fig.suptitle("Threshold Performance Summary", fontsize=14, fontweight="bold", y=0.995)
     save_plot(fig, "threshold_summary.png")
+    print("Saved: threshold_summary.png")
 
 
 def plot_bucket_contribution(df: pd.DataFrame):
@@ -341,30 +380,42 @@ def plot_bucket_contribution(df: pd.DataFrame):
     if tbl.empty:
         return
 
-    fig, ax = plt.subplots(figsize=(9, 6))
-    bars = ax.bar(tbl["Bucket"], tbl["Cumulative contribution"] * 100.0, color=["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974"])
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(tbl["Bucket"], tbl["Cumulative contribution"] * 100.0, 
+                  color=["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974"], edgecolor="black", linewidth=1.2)
     ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_title("Cumulative contribution by gap-strength bucket")
-    ax.set_ylabel("Cumulative contribution (%)")
-    ax.set_xlabel("Gap bucket")
+    ax.set_title("Cumulative Contribution by Gap-Strength Bucket", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Cumulative Contribution (%)", fontsize=11)
+    ax.set_xlabel("Gap Bucket", fontsize=11)
+    ax.grid(True, alpha=0.3, axis="y", linestyle="--")
+    
     for b, v in zip(bars, tbl["Cumulative contribution"] * 100.0):
-        ax.text(b.get_x() + b.get_width() / 2, v + 1.5, f"{v:.1f}%", ha="center", va="bottom")
+        ax.text(b.get_x() + b.get_width() / 2, v + 1.5 if v > 0 else v - 1.5, 
+                f"{v:.1f}%", ha="center", va="bottom" if v > 0 else "top", fontsize=10, fontweight="bold")
     fig.tight_layout()
     save_plot(fig, "bucket_contribution.png")
+    print("Saved: bucket_contribution.png")
 
 
 def plot_bucket_sharpe(df: pd.DataFrame):
     tbl = bucket_contribution(df)
     if tbl.empty:
         return
-    fig, ax = plt.subplots(figsize=(9, 6))
-    ax.bar(tbl["Bucket"], tbl["Sharpe"], color=["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974"])
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(tbl["Bucket"], tbl["Sharpe"], 
+                  color=["#4c72b0", "#55a868", "#c44e52", "#8172b3", "#ccb974"], edgecolor="black", linewidth=1.2)
     ax.axhline(0, color="black", linewidth=0.8)
-    ax.set_title("Sharpe by gap-strength bucket")
-    ax.set_ylabel("Sharpe")
-    ax.set_xlabel("Gap bucket")
+    ax.set_title("Sharpe Ratio by Gap-Strength Bucket", fontsize=13, fontweight="bold")
+    ax.set_ylabel("Sharpe", fontsize=11)
+    ax.set_xlabel("Gap Bucket", fontsize=11)
+    ax.grid(True, alpha=0.3, axis="y", linestyle="--")
+    
+    for b, v in zip(bars, tbl["Sharpe"]):
+        ax.text(b.get_x() + b.get_width() / 2, v + 0.05 if v > 0 else v - 0.05, 
+                f"{v:.2f}", ha="center", va="bottom" if v > 0 else "top", fontsize=10, fontweight="bold")
     fig.tight_layout()
     save_plot(fig, "bucket_sharpe.png")
+    print("Saved: bucket_sharpe.png")
 
 
 def plot_threshold_regime_lines(df: pd.DataFrame):
@@ -373,7 +424,7 @@ def plot_threshold_regime_lines(df: pd.DataFrame):
         ("Since 1994", "1994-02-04", None, []),
         ("Since 2000", "2000-01-01", None, []),
     ]
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     for ax, (label, start, end, exclude) in zip(axes, labels):
         sub = df.loc[date_mask(df, start=start, end=end, exclude_ranges=exclude)]
         rows = []
@@ -382,16 +433,19 @@ def plot_threshold_regime_lines(df: pd.DataFrame):
             m = metrics(out["strategy_ret"], out["position"])
             rows.append({"thr": thr, "Sharpe": m["Sharpe"], "CAGR": m["CAGR"] * 100.0, "MaxDD": m["MaxDD"] * 100.0})
         rows = pd.DataFrame(rows)
-        ax.plot(rows["thr"], rows["Sharpe"], marker="o", label="Sharpe")
+        ax.plot(rows["thr"], rows["Sharpe"], marker="o", label="Sharpe", linewidth=2, markersize=8)
         ax2 = ax.twinx()
-        ax2.plot(rows["thr"], rows["CAGR"], marker="s", color="C1", label="CAGR")
-        ax.set_title(label)
-        ax.set_xlabel("Threshold (bp)")
-        ax.set_ylabel("Sharpe")
-        ax2.set_ylabel("CAGR %")
-        ax.grid(True, alpha=0.25)
+        ax2.plot(rows["thr"], rows["CAGR"], marker="s", color="C1", label="CAGR", linewidth=2, markersize=8)
+        ax.set_title(label, fontsize=12, fontweight="bold")
+        ax.set_xlabel("Threshold (bp)", fontsize=10)
+        ax.set_ylabel("Sharpe", fontsize=10)
+        ax2.set_ylabel("CAGR %", fontsize=10)
+        ax.grid(True, alpha=0.3, linestyle="--")
+        ax.set_xticks(THRESHOLDS_BP)
+    fig.suptitle("Performance Across Thresholds by Period", fontsize=14, fontweight="bold", y=1.00)
     fig.tight_layout()
     save_plot(fig, "threshold_regime_lines.png")
+    print("Saved: threshold_regime_lines.png")
 
 
 # ---------------------------------------------------------------------------
@@ -429,11 +483,12 @@ def main():
     print_bucket_table(df)
 
     # Plotting
+    print("\n=== Generating plots ===")
+    plot_cumulative_returns_comparison(df)
     plot_threshold_summary(output)
     plot_bucket_contribution(df)
     plot_bucket_sharpe(df)
     plot_threshold_regime_lines(df)
-    print("Saved plots: threshold_summary.png, bucket_contribution.png, bucket_sharpe.png, threshold_regime_lines.png")
 
     # Interpretation
     interpret_edge(df)
