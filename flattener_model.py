@@ -101,27 +101,13 @@ def backtest(
     Returns dataframe with strategy returns, positions, and diagnostic info.
     """
     flat_ret, n2_lag = flattener_returns(df)
-    
-    # Signal: 1 when 2y yield is above fed funds by more than min_gap_pp
     signal = (df["gap"] > min_gap_pp).astype(float)
-    
-    # Volatility and position sizing
     vol = flat_ret.rolling(vol_window).std() * np.sqrt(252)
     w = (signal * target_vol / vol).clip(0, max_lev)
-    
-    # Rebalance every rebal_days
     w = w.iloc[::rebal_days].reindex(w.index).ffill()
-    
-    # Position held from t+1 (signal at close t, position in t+1)
     pos = w.shift(1)
-    
-    # Trading costs
     cost = pos.diff().abs() * (cost10_bps + cost2_bps * n2_lag.shift(1)) / 1e4
-    
-    # Strategy return
     strat = pos * flat_ret - cost
-    
-    # Build output dataframe
     out = pd.DataFrame(
         {
             "strategy": strat,
@@ -137,7 +123,6 @@ def backtest(
             "n2_lag": n2_lag,
         }
     ).dropna(subset=["strategy"])
-    
     return out.loc[EVAL_START:]
 
 
@@ -152,16 +137,16 @@ def metrics(r: pd.Series) -> dict:
             "MaxDD %": np.nan,
             "Calmar": np.nan,
         }
-    
+
     ann = r.mean() * 252
     vol = r.std() * np.sqrt(252)
     eq = (1 + r).cumprod()
     dd = eq / eq.cummax() - 1
-    
+
     sharpe = ann / vol if vol > 0 else np.nan
     max_dd = dd.min()
     calmar = ann / abs(max_dd) if max_dd < 0 else np.nan
-    
+
     return {
         "CAGR %": ann * 100,
         "Vol %": vol * 100,
@@ -169,6 +154,48 @@ def metrics(r: pd.Series) -> dict:
         "MaxDD %": max_dd * 100,
         "Calmar": calmar,
     }
+
+
+def strategy_metrics_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a dataframe comparing 0 bp and 25 bp threshold strategies."""
+    out0 = backtest(df, min_gap_pp=0.0)
+    out25 = backtest(df, min_gap_pp=0.25)
+
+    rows = []
+    for label, out in [("Gap > 0 bp (base)", out0), ("Gap > 25 bp (threshold)", out25)]:
+        m = metrics(out["strategy"])
+        rows.append(
+            {
+                "Strategy": label,
+                "CAGR %": m["CAGR %"],
+                "Vol %": m["Vol %"],
+                "Sharpe": m["Sharpe"],
+                "MaxDD %": m["MaxDD %"],
+                "Calmar": m["Calmar"],
+                "Trading Days": len(out),
+                "% Days Invested": (out["position"] > 0).mean() * 100,
+                "Final Equity": (1 + out["strategy"]).cumprod().iloc[-1],
+            }
+        )
+
+    table = pd.DataFrame(rows).set_index("Strategy")
+    table = table.round({
+        "CAGR %": 2,
+        "Vol %": 2,
+        "Sharpe": 2,
+        "MaxDD %": 2,
+        "Calmar": 2,
+        "% Days Invested": 1,
+        "Final Equity": 2,
+    })
+    return table
+
+
+def print_metrics_table(df: pd.DataFrame):
+    table = strategy_metrics_table(df)
+    print("\n=== Strategy Metrics Table ===")
+    print(table.to_string())
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -188,29 +215,20 @@ def save_trades_csv(out: pd.DataFrame, threshold_bp: float, filename: str):
 # Plotting
 # ---------------------------------------------------------------------------
 def plot_strategy_comparison(df: pd.DataFrame):
-    """
-    Create side-by-side comparison of gap > 0 bp vs gap > 25 bp,
-    matching the style of the provided reference image.
-    """
-    # Run both backtests
+    """Create side-by-side comparison of gap > 0 bp vs gap > 25 bp."""
     out0 = backtest(df, min_gap_pp=0.0)
     out25 = backtest(df, min_gap_pp=0.25)
-    
-    # Compute cumulative equity
+
     eq0 = (1 + out0["strategy"]).cumprod()
     eq25 = (1 + out25["strategy"]).cumprod()
-    
-    # Compute drawdowns
     dd0 = eq0 / eq0.cummax() - 1
     dd25 = eq25 / eq25.cummax() - 1
-    
-    # Create figure with two subplots
+
     fig = plt.figure(figsize=(14, 8))
     gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.30)
     ax_eq = fig.add_subplot(gs[0])
     ax_dd = fig.add_subplot(gs[1], sharex=ax_eq)
-    
-    # Styling
+
     SURF = "#fcfcfb"
     INK = "#0b0b0b"
     INK2 = "#52514e"
@@ -219,7 +237,7 @@ def plot_strategy_comparison(df: pd.DataFrame):
     AXIS = "#c3c2b7"
     C_BASE = "#2a78d6"
     C_THRESHOLD = "#eb6834"
-    
+
     fig.set_facecolor(SURF)
     for ax in [ax_eq, ax_dd]:
         ax.set_facecolor(SURF)
@@ -230,85 +248,52 @@ def plot_strategy_comparison(df: pd.DataFrame):
         ax.grid(axis="y", color=GRID, linewidth=0.5, linestyle="-")
         ax.set_axisbelow(True)
         ax.tick_params(axis="both", length=0, labelsize=9, labelcolor=MUTED)
-    
-    # Equity plot
+
     ax_eq.plot(eq0.index, eq0.values, color=C_BASE, linewidth=2.0, label="Gap > 0 bp (base)", solid_capstyle="round")
     ax_eq.plot(eq25.index, eq25.values, color=C_THRESHOLD, linewidth=2.0, label="Gap > 25 bp (threshold)", solid_capstyle="round")
-    
-    # Endpoint annotations
+
     ax_eq.scatter([eq0.index[-1]], [eq0.iloc[-1]], s=22, color=C_BASE, edgecolor=SURF, linewidth=1.0, zorder=5, clip_on=False)
     ax_eq.scatter([eq25.index[-1]], [eq25.iloc[-1]], s=22, color=C_THRESHOLD, edgecolor=SURF, linewidth=1.0, zorder=5, clip_on=False)
-    
     ax_eq.annotate(f"{eq0.iloc[-1]:.2f}x", (eq0.index[-1], eq0.iloc[-1]), xytext=(9, 0), textcoords="offset points",
                    va="center", fontsize=10, color=INK, annotation_clip=False)
     ax_eq.annotate(f"{eq25.iloc[-1]:.2f}x", (eq25.index[-1], eq25.iloc[-1]), xytext=(9, 6), textcoords="offset points",
                    va="center", fontsize=10, color=INK, annotation_clip=False)
-    
-    # Log scale
+
     ax_eq.set_yscale("log")
     lo = min(eq0.min(), eq25.min()) * 0.85
     hi = max(eq0.max(), eq25.max()) * 1.2
     ax_eq.set_ylim(lo, hi)
-    
-    # Y-axis ticks for log scale
     ticks = [t for t in (0.25, 0.5, 1, 2, 4, 8, 16, 32) if lo <= t <= hi]
     if len(ticks) >= 2:
         ax_eq.set_yticks(ticks)
         ax_eq.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}x"))
-    
+
     ax_eq.set_title("2s10s DV01-neutral flattener: Gap > 0 bp vs Gap > 25 bp", loc="left", fontsize=12, color=INK2, fontweight="bold", pad=8)
     ax_eq.legend(loc="upper left", frameon=False, fontsize=10, labelcolor=INK2, handlelength=1.8)
     plt.setp(ax_eq.get_xticklabels(), visible=False)
-    
-    # Drawdown plot
+
     ax_dd.plot(dd0.index, dd0.values * 100, color=C_BASE, linewidth=2.0, solid_capstyle="round")
     ax_dd.plot(dd25.index, dd25.values * 100, color=C_THRESHOLD, linewidth=2.0, solid_capstyle="round")
     ax_dd.axhline(0, color=AXIS, lw=0.5)
     ax_dd.yaxis.set_major_formatter(FuncFormatter(lambda v, _: "0%" if v == 0 else f"−{abs(v):.0f}%"))
     ax_dd.set_title("Drawdown from prior high", loc="left", fontsize=10, color=INK2, fontweight="bold", pad=8)
     ax_dd.set_ylabel("Drawdown", fontsize=9, color=MUTED)
-    
-    # X-axis formatting
+
     ax_dd.xaxis.set_major_locator(mdates.YearLocator(5))
     ax_dd.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
     ax_dd.set_xlim(eq0.index[0], eq0.index[-1])
     plt.setp(ax_dd.get_xticklabels(), rotation=45, ha="right")
-    
-    # Title and footer
+
     fig.text(0.075, 0.955, "Fed-cycle flattener: 0 bp vs 25 bp threshold comparison",
              fontsize=14, color=INK, fontweight="bold", va="top")
     fig.text(0.075, 0.918,
              f"DV01-neutral long 10Y / short 2Y. Signal: 2Y > Fed Funds (+ threshold). Vol-targeted 10%. {EVAL_START[:4]}–2026.\n"
              "Excess returns over cash, after costs. Not a recommendation to trade.",
              fontsize=9.5, color=INK2, va="top", linespacing=1.5)
-    
+
     fig.savefig("flattener_comparison.png", dpi=180, facecolor=SURF, bbox_inches="tight")
     plt.close(fig)
     print("Saved: flattener_comparison.png")
-
-
-# ---------------------------------------------------------------------------
-# Print summary stats
-# ---------------------------------------------------------------------------
-def print_comparison_metrics(df: pd.DataFrame):
-    out0 = backtest(df, min_gap_pp=0.0)
-    out25 = backtest(df, min_gap_pp=0.25)
-    
-    m0 = metrics(out0["strategy"])
-    m25 = metrics(out25["strategy"])
-    
-    print("\n=== Strategy Comparison ===")
-    print(f"\nGap > 0 bp (BASE):")
-    for key, val in m0.items():
-        print(f"  {key}: {val:.2f}" if np.isfinite(val) else f"  {key}: {val}")
-    print(f"  % days in market: {(out0['position'] > 0).mean() * 100:.1f}%")
-    
-    print(f"\nGap > 25 bp (THRESHOLD):")
-    for key, val in m25.items():
-        print(f"  {key}: {val:.2f}" if np.isfinite(val) else f"  {key}: {val}")
-    print(f"  % days in market: {(out25['position'] > 0).mean() * 100:.1f}%")
-    
-    print()
 
 
 # ---------------------------------------------------------------------------
@@ -317,18 +302,11 @@ def print_comparison_metrics(df: pd.DataFrame):
 def main():
     raw = {sid: load_fred(sid) for sid in SERIES}
     df = prepare(raw)
-    
-    # Run base strategy (threshold 0)
+
     out_base = backtest(df, min_gap_pp=0.0)
-    
-    # Save trades CSV for the base strategy
     save_trades_csv(out_base, threshold_bp=0, filename="flattener_trades_0bp.csv")
-    
-    # Print metrics comparison
-    print_comparison_metrics(df)
-    
-    # Plot comparison
-    print("\n=== Generating plot ===")
+
+    print_metrics_table(df)
     plot_strategy_comparison(df)
 
 
