@@ -86,8 +86,6 @@ def flattener_returns(df: pd.DataFrame):
 def backtest_binary_threshold(df: pd.DataFrame, threshold_bp: float, cost10_bps: float = 1.0, cost2_bps: float = 0.3) -> pd.DataFrame:
     flat_ret, n2_lag = flattener_returns(df)
     signal = (df["flattener_gap"] > threshold_bp / 10000.0).astype(float)
-    # Note: position is stored in the convention described in the research note.
-    # Active flattener signal => position = -1. Long-flattener economic exposure = -position.
     position = (-signal.shift(1).fillna(0.0)).astype(float)
     exposure = -position
     cost = position.diff().abs().fillna(0.0) * (cost10_bps + cost2_bps * n2_lag.shift(1)) / 1e4
@@ -232,7 +230,6 @@ def bucket_contribution(df: pd.DataFrame):
     gap = df["flattener_gap"]
     positive_gap = gap > 0
 
-    # 0-25, 25-50, 50-75, 75-100, >100
     bucket_defs = [
         ("0-25 bp", lambda g: (g > 0.0 / 10000.0) & (g <= 25.0 / 10000.0)),
         ("25-50 bp", lambda g: (g > 25.0 / 10000.0) & (g <= 50.0 / 10000.0)),
@@ -301,39 +298,51 @@ def save_plot(fig, path: str):
 
 
 def plot_cumulative_returns_comparison(df: pd.DataFrame):
-    """Plot cumulative returns for gap > 0 vs gap > 25 bp side by side."""
+    """Compare cumulative returns for gap > 0 bp and gap > 25 bp."""
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    thresholds_to_plot = [0, 25]
+
+    thresholds = [0, 25]
     colors = ["#2E86AB", "#A23B72"]
-    
-    for ax, threshold, color in zip(axes, thresholds_to_plot, colors):
+
+    for ax, threshold, color in zip(axes, thresholds, colors):
         out = backtest_binary_threshold(df, threshold)
-        out = out.loc["1981-07-14":]  # Match eval_start from original
-        
-        # Cumulative returns
-        cumulative_ret = (1.0 + out["strategy_ret"]).cumprod()
-        ax.plot(cumulative_ret.index, cumulative_ret.values, linewidth=2.0, color=color, label=f"Gap > {threshold} bp")
-        
-        # Add fill to show drawdowns
-        dd = cumulative_ret / cumulative_ret.cummax() - 1.0
-        ax.fill_between(cumulative_ret.index, cumulative_ret.values, cumulative_ret.cummax(), alpha=0.2, color=color)
-        
-        # Formatting
+        out = out.loc["1981-07-14":]
+
+        eq = (1.0 + out["strategy_ret"]).cumprod()
+        ax.plot(eq.index, eq.values, linewidth=2.2, color=color, label=f"Gap > {threshold} bp")
+        ax.fill_between(eq.index, eq.values, eq.cummax(), color=color, alpha=0.12)
+
+        m = metrics(out["strategy_ret"], out["position"])
+        text = (
+            f"CAGR: {m['CAGR'] * 100:.2f}%\n"
+            f"Sharpe: {m['Sharpe']:.2f}\n"
+            f"Vol: {m['Volatility'] * 100:.2f}%\n"
+            f"MaxDD: {m['MaxDD'] * 100:.2f}%\n"
+            f"Calmar: {m['Calmar']:.2f}\n"
+            f"Days: {m['TradingDays']}\n"
+            f"% Invested: {m['PctInvested']:.1f}%"
+        )
+        ax.text(
+            0.02,
+            0.98,
+            text,
+            transform=ax.transAxes,
+            fontsize=9.5,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.85),
+            family="monospace",
+        )
+
         ax.set_yscale("log")
-        ax.set_title(f"Gap > {threshold} bp: Cumulative Returns", fontsize=13, fontweight="bold")
+        ax.set_title(f"Gap > {threshold} bp", fontsize=13, fontweight="bold")
         ax.set_xlabel("Date", fontsize=11)
         ax.set_ylabel("Growth of $1 (log scale)", fontsize=11)
-        ax.grid(True, alpha=0.3, linestyle="--")
-        
-        # Metrics
-        m = metrics(out["strategy_ret"], out["position"])
-        textstr = f"CAGR: {m['CAGR']*100:.2f}%\nSharpe: {m['Sharpe']:.2f}\nVol: {m['Volatility']*100:.2f}%\nMaxDD: {m['MaxDD']*100:.2f}%\nCalmar: {m['Calmar']:.2f}\nDays: {m['TradingDays']}\n% Invested: {m['PctInvested']:.1f}%"
-        ax.text(0.02, 0.98, textstr, transform=ax.transAxes, fontsize=10, verticalalignment="top",
-                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8), family="monospace")
-    
+        ax.grid(True, alpha=0.25, linestyle="--")
+        ax.legend(loc="upper left", fontsize=9)
+
     fig.tight_layout()
-    save_plot(fig, "cumulative_returns_comparison.png")
+    fig.savefig("cumulative_returns_comparison.png", dpi=180, bbox_inches="tight")
+    plt.close(fig)
     print("Saved: cumulative_returns_comparison.png")
 
 
@@ -388,7 +397,7 @@ def plot_bucket_contribution(df: pd.DataFrame):
     ax.set_ylabel("Cumulative Contribution (%)", fontsize=11)
     ax.set_xlabel("Gap Bucket", fontsize=11)
     ax.grid(True, alpha=0.3, axis="y", linestyle="--")
-    
+
     for b, v in zip(bars, tbl["Cumulative contribution"] * 100.0):
         ax.text(b.get_x() + b.get_width() / 2, v + 1.5 if v > 0 else v - 1.5, 
                 f"{v:.1f}%", ha="center", va="bottom" if v > 0 else "top", fontsize=10, fontweight="bold")
@@ -409,7 +418,7 @@ def plot_bucket_sharpe(df: pd.DataFrame):
     ax.set_ylabel("Sharpe", fontsize=11)
     ax.set_xlabel("Gap Bucket", fontsize=11)
     ax.grid(True, alpha=0.3, axis="y", linestyle="--")
-    
+
     for b, v in zip(bars, tbl["Sharpe"]):
         ax.text(b.get_x() + b.get_width() / 2, v + 0.05 if v > 0 else v - 0.05, 
                 f"{v:.2f}", ha="center", va="bottom" if v > 0 else "top", fontsize=10, fontweight="bold")
@@ -452,7 +461,6 @@ def plot_threshold_regime_lines(df: pd.DataFrame):
 # Interpretation
 # ---------------------------------------------------------------------------
 def interpret_edge(df: pd.DataFrame):
-    # Simple diagnostic: compare the 25-100 bp bucket contribution share to the 0-25 bp share
     tbl = bucket_contribution(df)
     if tbl.empty:
         return
@@ -475,14 +483,10 @@ def main():
     raw = {sid: load_fred(sid) for sid in SERIES}
     df = prepare(raw)
 
-    # Main threshold analytics
     output = threshold_results(df)
     print_threshold_table(output)
-
-    # Marginal contribution analysis
     print_bucket_table(df)
 
-    # Plotting
     print("\n=== Generating plots ===")
     plot_cumulative_returns_comparison(df)
     plot_threshold_summary(output)
@@ -490,7 +494,6 @@ def main():
     plot_bucket_sharpe(df)
     plot_threshold_regime_lines(df)
 
-    # Interpretation
     interpret_edge(df)
 
 
