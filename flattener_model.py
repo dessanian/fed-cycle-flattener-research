@@ -201,13 +201,30 @@ def print_metrics_table(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 # Save trade-level CSV
 # ---------------------------------------------------------------------------
-def save_trades_csv(out: pd.DataFrame, threshold_bp: float, filename: str):
-    """Export every day of the strategy with position, gap, returns, etc."""
+def save_trades_csv(out: pd.DataFrame, threshold_bp: float, filename: str, append: bool = False):
+    """Export trade-level records to a CSV. Append rows if requested."""
     export = out[["gap", "y2", "y10", "ff_s", "position", "flat_ret", "strategy", "cost"]].copy()
-    export.columns = ["gap_pp", "y2_yield_%", "y10_yield_%", "ff_s_%", "position_size", "flattener_ret", "strategy_ret", "cost_bps"]
+    export.columns = [
+        "gap_pp",
+        "y2_yield_%",
+        "y10_yield_%",
+        "ff_s_%",
+        "position_size",
+        "flattener_ret",
+        "strategy_ret",
+        "cost_bps",
+    ]
     export["threshold_bp"] = threshold_bp
+    export["strategy_name"] = f"gap_gt_{threshold_bp}_bp"
     export["in_market"] = (export["position_size"] > 0).astype(int)
-    export.to_csv(filename)
+
+    if append and os.path.exists(filename):
+        existing = pd.read_csv(filename)
+        combined = pd.concat([existing, export], ignore_index=True)
+        combined.to_csv(filename, index=False)
+    else:
+        export.to_csv(filename, index=False)
+
     print(f"Saved: {filename}")
 
 
@@ -304,7 +321,10 @@ def main():
     df = prepare(raw)
 
     out_base = backtest(df, min_gap_pp=0.0)
-    save_trades_csv(out_base, threshold_bp=0, filename="flattener_trades_0bp.csv")
+    out_25 = backtest(df, min_gap_pp=0.25)
+
+    save_trades_csv(out_base, threshold_bp=0, filename="flattener_trades.csv", append=False)
+    save_trades_csv(out_25, threshold_bp=25, filename="flattener_trades.csv", append=True)
 
     print_metrics_table(df)
     plot_strategy_comparison(df)
